@@ -76,7 +76,7 @@ func make_config(t *testing.T, n int, unreliable bool) *config {
 	return cfg
 }
 
-// shut down a Raft server but save its persistent state.
+// shut down a Raft server.
 func (cfg *config) crash1(i int) {
 	cfg.disconnect(i)
 	cfg.net.DeleteServer(i) // disable client connections to the server.
@@ -96,8 +96,8 @@ func (cfg *config) crash1(i int) {
 //
 // start or re-start a Raft.
 // if one already exists, "kill" it first.
-// allocate new outgoing port file names, and a new
-// state persister, to isolate previous instance of
+// allocate new outgoing port file names
+// to isolate previous instance of
 // this server. since we cannot really kill it.
 //
 func (cfg *config) start1(i int) {
