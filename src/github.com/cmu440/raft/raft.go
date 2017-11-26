@@ -19,6 +19,8 @@ package raft
 
 import "sync"
 import "github.com/cmu440/labrpc"
+import "math/rand"
+import "time"
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -35,6 +37,17 @@ type ApplyMsg struct {
 //
 // A Go object implementing a single Raft peer.
 //
+type Log struct {
+	Command interface{}
+	Term    int
+}
+
+const (
+	Follower  = iota
+	Candidate = iota
+	Leader    = iota
+)
+
 type Raft struct {
 	mu    sync.Mutex          // Lock to protect shared access to this peer's state
 	peers []*labrpc.ClientEnd // RPC end points of all peers
@@ -43,7 +56,20 @@ type Raft struct {
 	// Your data here (3A, 3B).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-
+	state           int
+	currentTerm     int
+	votedFor        int
+	logs            []Logs
+	commitIndex     int
+	lastApplied     int
+	nextIndex       []int
+	matchIndex      []int
+	applyCh         chan ApplyMsg
+	numServers      int
+	electionTimeout int
+	validRPC        chan int
+	validHeartbeat  chan int
+	votes           int
 }
 
 // return currentTerm and whether this server
@@ -61,6 +87,9 @@ func (rf *Raft) GetState() (int, bool) {
 //
 type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
+	Term int
+	Id   int
+	//TODO:Log checking to be implemented after the checkpoint
 }
 
 //
@@ -69,6 +98,17 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (3A).
+	Term int
+	Vote bool
+}
+
+type AppendEntriesArgs struct {
+	Term int
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success int
 }
 
 //
@@ -76,6 +116,25 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
+	//TODO: Modify for handling logs! Before voting check if the candidate is up to date
+	//TODO: Where should the reply.votedFor reset to zero? => start of a new term
+	if rf.currentTerm > args.Term {
+		reply.Vote = false
+	} else {
+		if rf.currentTerm < args.Term {
+			rf.currentTerm = args.Term
+			rf.votedFor = -1
+		}
+		if rf.votedFor == nil || rf.votedFor == args.Id {
+			rf.votedFor = args.Id
+			reply.Vote = true
+		}
+	}
+	reply.Term = rf.currentTerm
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+
 }
 
 //
@@ -107,9 +166,62 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 //
+/*
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
+}
+*/
+
+func (rf *Raft) sendAppendEntries(server int) {
+	//Define Args and Reply
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+}
+
+/*
+This function repeatedly sends requestVotes to a server until it succeed. However, election timeout occurs, electionOver channel must be closed! If vote is given, votes are incremented. If the server wins the election, then voteResult is signalled True, if server does not get the vote, then nothing is signalled. If the term received is greater than current term, then currentTerm is incremented and a false is passed over voteResult to signal to the candidate to convert to a follower!
+*/
+func (rf *Raft) sendRequestVote(server int, electionTimeout chan int, electionOver chan int, voteResult chan bool) {
+	args = &RequestVoteArgs{}
+	args.Term = rf.currentTerm
+	args.Id = rf.me
+	reply = &RequestVoteReply{}
+	reply.Term = 0
+	reply.Vote = false
+	for {
+		select {
+		case <-electionTimeout:
+			select {
+			case voteResult <- false:
+			case <-electionOver:
+			}
+			return
+		default:
+			ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+			if ok {
+				break
+			}
+		}
+	}
+	if reply.Term > rf.currentTerm {
+		rf.currentTerm = reply.Term
+		rf.votedFor = -1
+		select {
+		case voteResult <- false:
+		case <-electionOver:
+		}
+	} else if reply.Vote {
+		//TODO: acquire mutex around the following block
+		rf.votes += 1
+		if 2*rf.votes < rf.numServers {
+			return
+		}
+
+		select {
+		case voteResult <- true:
+		case <-electionOver:
+		}
+	}
 }
 
 //
@@ -154,12 +266,114 @@ func (rf *Raft) Kill() {
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
 //
+
+//Code for signalling for an election.
+//rf.validRPC must be invoked in conjunction with a default upon receiving heartbeat appendEntries rpc from the current leader or granting a vote to a candidate
+
+func (rf *Raft) SignalElection(c chan int) {
+	//TODO: Think of ways to manage validRPC
+	electionTimer := time.NewTimer(time.Duration(rf.electionTimeout) * time.Millisecond).C
+	for {
+		select {
+		case <-electionTimer:
+			close(c)
+			break
+		case <-rf.validRPC:
+			electionTimer := time.NewTimer(time.Duration(rf.electionTimeout) * time.Millisecond).C
+		}
+	}
+}
+
+func (rf *Raft) SignalReElection(c chan int) {
+	electionTimer := time.newTimer(time.Duration(rf.electionTimeout) * time.Millisecond).C
+	select {
+	case <-electionTimer:
+		close(c)
+	}
+}
+
+//Code for being in the candidate state (running election)
+//Right now the state of the graph is accessed unprotected
+func (rf *Raft) RunElection() {
+	rf.state = Candidate
+	//Increment current term and vote for self
+	rf.currentTerm += 1
+	rf.votedFor = rf.me
+	rf.votes = 1
+	//Start timer and wait for 3 outcomes: timeout, valid heartbeat or winning election.
+	electionTimeout := make(chan int)
+	electionOver := make(chan int)
+	voteResult := make(chan bool)
+	for i := 0; i < rf.numServers; i++ {
+		if i == rf.me {
+			continue
+		}
+		rf.sendRequestVote(i, electionTimeout, electionOver, voteResult)
+	}
+	go rf.SignalReElection(electionTimeout)
+	select {
+	case k := <-voteResult:
+		if k {
+			//Elected leader
+			close(electionOver)
+			go rf.Lead()
+		} else {
+			//Go to follower state
+			close(electionOver)
+			go rf.Follow()
+		}
+		//TODO: insert case when heartbeat from a competitor is received. Use validHeartbeat channel
+	}
+}
+
+//Code for being a leader
+func (rf *Raft) Lead() {
+
+}
+
+//Code for being in the follower state
+func (rf *Raft) Follow() {
+	rf.state = Follower
+	ch := make(chan int)
+	go rf.SignalElection(ch)
+	//Wait for the election timeout signal, till then remain in the follower state and serve RPCs
+	<-ch
+	go rf.RunElection()
+}
+
 func Make(peers []*labrpc.ClientEnd, me int, applyCh chan ApplyMsg) *Raft {
+
+	//Initialize the state to be kept in the raft
 	rf := &Raft{}
 	rf.peers = peers
 	rf.me = me
+	rf.state = Follower
+	rf.currentTerm = 0
+	rf.votedFor = -1
+	rf.logs = make([]Log, 1)
+	rf.commitIndex = 0
+	rf.votes = 0
+	rf.lastApplied = 0
+	rf.numServers = len(peers)
+	rf.nextIndex = make([]int, rf.numServers)
+	rf.matchIndex = make([]int, rf.numServers)
+	rf.validRPC = make(chan int)
+	rf.validHeartbeat = nil
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 
-	// Your initialization code here (3A, 3B).
+	//Election timeout is randomly chosen between 1000 to 2000 milliseconds, however it is kept fixed for the lifetime of the server right now
+	rf.electionTimeout = 1000 + r.Intn(1000)
 
+	for i := 0; i < rf.numServers; i++ {
+		rf.nextIndex[i] = 1
+		rf.matchIndex[i] = 0
+	}
+	rf.applyCh = applyCh
+
+	//Register for RPC
+	//I believe that methods in config.go does that
+
+	//Launch the server in the follower state and return
+	go rf.Follow()
 	return rf
 }
