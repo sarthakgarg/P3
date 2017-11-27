@@ -136,11 +136,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Vote = false
 	} else {
 		if rf.currentTerm < args.Term {
-
 			rf.currentTerm = args.Term
-
 			rf.votedFor = -1
-			//Signal to become a follower if not
 			if rf.followCh != nil {
 				select {
 				case <-rf.followCh:
@@ -244,6 +241,14 @@ func (rf *Raft) sendRequestVote(server int, electionTimeout chan int, electionOv
 	args := &RequestVoteArgs{}
 	rf.mu.Lock()
 	args.Term = rf.currentTerm
+	select {
+	case <-rf.followCh:
+		voteResult <- false
+		go rf.Follow()
+		rf.mu.Unlock()
+		return
+	default:
+	}
 	rf.mu.Unlock()
 	args.Id = rf.me
 	reply := &RequestVoteReply{}
@@ -271,6 +276,12 @@ func (rf *Raft) sendRequestVote(server int, electionTimeout chan int, electionOv
 
 		rf.currentTerm = reply.Term
 		rf.votedFor = -1
+
+		select {
+		case <-rf.followCh:
+		default:
+			close(rf.followCh)
+		}
 
 		select {
 		case voteResult <- false:
@@ -410,16 +421,16 @@ func (rf *Raft) RunElection() {
 //Code for sending a heartbeat to all servers
 func (rf *Raft) sendHeartBeat() bool {
 	for i := 0; i < rf.numServers; i++ {
-		select {
-		case <-rf.followCh:
-			return false
-		default:
-		}
 		if i == rf.me {
 			continue
 		}
 		rf.mu.Lock()
 		k := rf.currentTerm
+		select {
+		case <-rf.followCh:
+			return false
+		default:
+		}
 		rf.mu.Unlock()
 		args := &AppendEntriesArgs{k}
 		reply := &AppendEntriesReply{0, false}
@@ -431,7 +442,6 @@ func (rf *Raft) sendHeartBeat() bool {
 			return false
 		case <-completeCh:
 		}
-		//		fmt.Printf("%d is now UnStuck\n", rf.me)
 
 		if reply.Term > k {
 			rf.mu.Lock()
