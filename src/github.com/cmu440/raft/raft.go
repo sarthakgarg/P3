@@ -56,20 +56,21 @@ type Raft struct {
 	// Your data here (3A, 3B).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	state           int
-	currentTerm     int
-	votedFor        int
-	logs            []Logs
-	commitIndex     int
-	lastApplied     int
-	nextIndex       []int
-	matchIndex      []int
-	applyCh         chan ApplyMsg
-	numServers      int
-	electionTimeout int
-	validRPC        chan int
-	validHeartbeat  chan int
-	votes           int
+	state            int
+	currentTerm      int
+	votedFor         int
+	logs             []Logs
+	commitIndex      int
+	lastApplied      int
+	nextIndex        []int
+	matchIndex       []int
+	applyCh          chan ApplyMsg
+	numServers       int
+	electionTimeout  int
+	heartbeatTimeout int
+	followCh         chan int
+	votes            int
+	activityCh       chan int
 }
 
 // return currentTerm and whether this server
@@ -114,6 +115,10 @@ type AppendEntriesReply struct {
 //
 // example RequestVote RPC handler.
 //
+//TODO:Implement the interrupt, leading to state change
+
+//TODO: Heavy concurrency between RPC calls and all other methods, protect access to raft state using a global mutex
+
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
 	//TODO: Modify for handling logs! Before voting check if the candidate is up to date
@@ -124,17 +129,56 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		if rf.currentTerm < args.Term {
 			rf.currentTerm = args.Term
 			rf.votedFor = -1
+			//Signal to become a follower if not
+			if rf.followCh {
+				select {
+				case <-rf.followCh:
+				default:
+					close(rf.followCh)
+				}
+			}
 		}
-		if rf.votedFor == nil || rf.votedFor == args.Id {
+		if rf.votedFor == -1 || rf.votedFor == args.Id {
 			rf.votedFor = args.Id
 			reply.Vote = true
+			//TODO: think about moving this to condition rf.votedFor == -1
+			select {
+			case <-rf.activityCh:
+			default:
+				close(rf.activityCh)
+			}
 		}
 	}
 	reply.Term = rf.currentTerm
 }
 
+//TODO: Implement the interrupts in append and request vote rpc
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-
+	//Toy implementation for checkpoint, just compare the term and return
+	if rf.currentTerm > args.Term {
+		reply.Success = false
+		reply.Term = rf.currentTerm
+	} else {
+		//Can be a heartbeat from some other newly appointed leader
+		if rf.currentTerm == args.Term {
+			reply.Success = true
+		} else {
+			rf.currentTerm = args.Term
+			rf.votedFor = -1
+		}
+		if rf.followCh {
+			select {
+			case <-rf.followCh:
+			default:
+				close(rf.followCh)
+			}
+		}
+		select {
+		case <-rf.activityCh:
+		default:
+			close(rf.activityCh)
+		}
+	}
 }
 
 //
@@ -173,8 +217,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 */
 
-func (rf *Raft) sendAppendEntries(server int) {
-	//Define Args and Reply
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 }
 
@@ -267,19 +310,27 @@ func (rf *Raft) Kill() {
 // for any long-running work.
 //
 
+//Code for signalling for sending a heartbeat
+
+func (rf *Raft) SignalHeartbeat(c chan int) {
+	heartbeatTimer := time.NewTimer(time.Duration(rf.heartbeatTimeout) * time.Millisecond).C
+	<-heartbeatTimer
+	close(c)
+}
+
 //Code for signalling for an election.
 //rf.validRPC must be invoked in conjunction with a default upon receiving heartbeat appendEntries rpc from the current leader or granting a vote to a candidate
 
 func (rf *Raft) SignalElection(c chan int) {
 	//TODO: Think of ways to manage validRPC
-	electionTimer := time.NewTimer(time.Duration(rf.electionTimeout) * time.Millisecond).C
 	for {
+		rf.activityCh = make(chan int)
+		electionTimer := time.NewTimer(time.Duration(rf.electionTimeout) * time.Millisecond).C
 		select {
 		case <-electionTimer:
 			close(c)
 			break
-		case <-rf.validRPC:
-			electionTimer := time.NewTimer(time.Duration(rf.electionTimeout) * time.Millisecond).C
+		case <-rf.activityCh:
 		}
 	}
 }
@@ -308,6 +359,7 @@ func (rf *Raft) RunElection() {
 		if i == rf.me {
 			continue
 		}
+		//TODO: think about whether we should keep retrying failed requestVote rpcs
 		rf.sendRequestVote(i, electionTimeout, electionOver, voteResult)
 	}
 	go rf.SignalReElection(electionTimeout)
@@ -323,12 +375,62 @@ func (rf *Raft) RunElection() {
 			go rf.Follow()
 		}
 		//TODO: insert case when heartbeat from a competitor is received. Use validHeartbeat channel
+	case <-rf.followCh:
+		//Somebody else probably won the election
+		close(electionOver)
+		go rf.Follow()
 	}
 }
 
-//Code for being a leader
-func (rf *Raft) Lead() {
+//Code for sending a heartbeat to all servers
+func (rf *Raft) sendHeartBeat() bool {
+	for i := 0; i < rf.numServers; i++ {
+		select {
+		case <-rf.followCh:
+			return false
+		default:
+		}
+		if i == rf.me {
+			continue
+		}
+		args = &AppendEntriesArgs{rf.currentTerm}
+		reply = &AppendEntriesReply{0, false}
+		rf.sendAppendEntries(i, args, reply)
+		if reply.Term > rf.currentTerm {
+			rf.currentTerm = reply.Term
+			rf.votedFor = -1
+			return false
+		}
+	}
+	return true
+}
 
+//Code for being a leader
+//For now the leader just sends a heartbeat periodically to all servers
+func (rf *Raft) Lead() {
+	rf.state = Leader
+	k := rf.sendHeartBeat()
+	if !k {
+		go rf.Follow()
+		return
+	}
+	//TODO: Fix, right now, just sending heartbeats at regular intervals
+	for {
+		c := make(chan int)
+		go rf.SignalHeartbeat()
+		select {
+		case <-c:
+		case <-rf.followCh:
+			go rf.Follow()
+			return
+		}
+		<-c
+		k = rf.sendHeartBeat()
+		if !k {
+			go rf.Follow()
+			return
+		}
+	}
 }
 
 //Code for being in the follower state
@@ -338,6 +440,7 @@ func (rf *Raft) Follow() {
 	go rf.SignalElection(ch)
 	//Wait for the election timeout signal, till then remain in the follower state and serve RPCs
 	<-ch
+	rf.followCh = make(chan int)
 	go rf.RunElection()
 }
 
@@ -353,12 +456,14 @@ func Make(peers []*labrpc.ClientEnd, me int, applyCh chan ApplyMsg) *Raft {
 	rf.logs = make([]Log, 1)
 	rf.commitIndex = 0
 	rf.votes = 0
+	rf.activityCh = make(chan int)
+	rf.heartbeatTimeout = 100
 	rf.lastApplied = 0
 	rf.numServers = len(peers)
 	rf.nextIndex = make([]int, rf.numServers)
 	rf.matchIndex = make([]int, rf.numServers)
-	rf.validRPC = make(chan int)
-	rf.validHeartbeat = nil
+	//followCh is used to signal by the the RPC calls to transition into the follower state from the leader or the candidate state. It is made once the server transitions out from the follower state
+	rf.followCh = nil
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	//Election timeout is randomly chosen between 1000 to 2000 milliseconds, however it is kept fixed for the lifetime of the server right now
